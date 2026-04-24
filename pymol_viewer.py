@@ -810,6 +810,7 @@ class DataExtractionWorker(QThread):
                 try:
                     cmd.load(filepath, cx.name)
                 except Exception as exc:
+                    cmd.delete("all")
                     rows.append(self._empty_row(cx))
                     continue
                 finally:
@@ -856,10 +857,7 @@ class DataExtractionWorker(QThread):
                         "stored.append(resn + resi)",
                         space={"stored": stored},
                     )
-                    seen: dict = {}
-                    for r in stored:
-                        seen.setdefault(r, None)
-                    binding_residues = list(seen.keys())
+                    binding_residues = list(dict.fromkeys(stored))
                 except Exception:
                     pass
 
@@ -1196,11 +1194,16 @@ class RAnalysisPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _load_template(self, name: str):
-        if name == "Custom Script \u2026":
-            # Don't overwrite a custom script the user may already be editing
+        # The last template is the "Custom Script" placeholder – don't clobber
+        # whatever the user may have typed.  We identify it by position rather
+        # than a hard-coded string so that localisation / encoding differences
+        # cannot break the check.
+        template_keys = list(_R_TEMPLATES.keys())
+        if not template_keys or name == template_keys[-1]:
             return
         script = _R_TEMPLATES.get(name, "")
-        self.script_editor.setPlainText(script.strip())
+        if script:
+            self.script_editor.setPlainText(script.strip())
 
     # ------------------------------------------------------------------
     # Data extraction
@@ -1384,7 +1387,8 @@ class RAnalysisPanel(QWidget):
         if path:
             with open(path, encoding="utf-8") as f:
                 self.script_editor.setPlainText(f.read())
-            self.w_template.setCurrentText("Custom Script \u2026")
+            # Select the last template entry (custom placeholder) by index
+            self.w_template.setCurrentIndex(self.w_template.count() - 1)
 
 
 
@@ -1635,7 +1639,7 @@ class SettingsDialog(QDialog):
     def _browse_r(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select Rscript executable",
-            self.w_r.text() or ("C:\\" if platform.system() == "Windows" else "/usr"),
+            self.w_r.text() or (r"C:\\" if platform.system() == "Windows" else "/usr"),
             "Executables (*.exe Rscript);;All (*)"
         )
         if path:
