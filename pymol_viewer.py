@@ -61,9 +61,9 @@ from matplotlib.patches import FancyArrowPatch
 PROTEIN_REPRS = ["cartoon", "ribbon", "surface", "lines", "sticks", "sphere"]
 LIGAND_REPRS = ["sticks", "ball_and_stick", "sphere", "lines"]
 COLOR_SCHEMES = [
-    "chain",      # util.cbc – different colour per chain
-    "element",    # CPK colouring
-    "spectrum",   # rainbow along residue number
+    "chain",      # util.cbc – different color per chain
+    "element",    # CPK coloring
+    "spectrum",   # rainbow along residue index
     "bfactor",    # blue→white→red by B-factor
     "white",
     "cyan",
@@ -473,14 +473,14 @@ class ComplexSettingsPanel(QWidget):
         self.w_prot_color.addItems(COLOR_SCHEMES)
         self.w_prot_color.setCurrentText(self.entry.protein_color)
         self.w_prot_color.currentTextChanged.connect(self._sync)
-        layout.addRow("Protein colour:", self.w_prot_color)
+        layout.addRow("Protein color:", self.w_prot_color)
 
-        # Ligand colour
+        # Ligand color
         self.w_lig_color = QComboBox()
         self.w_lig_color.addItems(COLOR_SCHEMES)
         self.w_lig_color.setCurrentText(self.entry.ligand_color)
         self.w_lig_color.currentTextChanged.connect(self._sync)
-        layout.addRow("Ligand colour:", self.w_lig_color)
+        layout.addRow("Ligand color:", self.w_lig_color)
 
         # Surface
         self.w_surface = QCheckBox("Show protein surface")
