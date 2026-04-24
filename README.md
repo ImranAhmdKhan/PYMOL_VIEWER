@@ -3,6 +3,8 @@
 A PyQt5 GUI for generating **publication-quality images** of multiple
 protein–ligand docking complexes arranged in a **subplot grid**, using PyMOL
 as the rendering back-end, with optional interactive launch via PyMOL or VMD.
+A built-in **R Analytics** module lets you extract molecular interaction data
+and run statistical analyses directly from the application.
 
 ---
 
@@ -21,6 +23,7 @@ as the rendering back-end, with optional interactive launch via PyMOL or VMD.
 | **Quick Preview** | Low-resolution, no ray-tracing – instant feedback |
 | **Open in PyMOL** | Launch files in PyMOL interactive GUI (Schrödinger or open-source) |
 | **Open in VMD** | Launch files in VMD for further analysis |
+| **R Analytics** | Extract interaction data; run built-in or custom R scripts; display plots |
 
 ---
 
@@ -32,6 +35,7 @@ PyMOL (open-source or Schrödinger bundle)
 PyQt5
 Pillow
 matplotlib
+R ≥ 4.0  (optional – required for the R Analytics tab)
 ```
 
 ### Install dependencies
@@ -49,7 +53,7 @@ pip install pymol-open-source
 
 ---
 
-## Configuring PyMOL and VMD paths
+## Configuring PyMOL, VMD and R paths
 
 Open **Tools → Settings** (or press `Ctrl+,`) and set:
 
@@ -57,10 +61,9 @@ Open **Tools → Settings** (or press `Ctrl+,`) and set:
 |---|---|
 | **PyMOL Scripts path** | `C:\Users\<username>\AppData\Local\Schrodinger\PyMOL2\Scripts` |
 | **VMD executable** | `C:\Users\<username>\Desktop\VMD 2.0.lnk` or the full path to `vmd.exe` |
+| **Rscript executable** | `Rscript` (Unix/macOS) or `C:\Program Files\R\R-4.x.x\bin\Rscript.exe` |
 
-These settings are saved between sessions.  The PyMOL scripts directory is
-automatically added to `sys.path` so that `import pymol2` resolves to your
-chosen build.
+These settings are saved between sessions.
 
 ---
 
@@ -90,6 +93,76 @@ python pymol_viewer.py
    output file.
 6. **Open in PyMOL / VMD** – launch the loaded file(s) directly in the
    corresponding interactive viewer for further analysis.
+7. **R Analysis tab** – extract molecular data and run statistical plots
+   (see below).
+
+---
+
+## R Analytics
+
+The **📊 R Analysis** tab provides commercial software-level statistical
+analysis of your docking results directly inside the application.
+
+### Workflow
+
+1. Load your structure files as normal.
+2. Switch to the **📊 R Analysis** tab.
+3. Click **📊 Extract Data from PyMOL** – headless PyMOL computes:
+   - Protein–ligand H-bond count (3.5 Å / 50° cutoff)
+   - Close-contact count (configurable cutoff per complex)
+   - Binding-site residues within the label radius
+   - Ligand heavy atom count
+4. Select a built-in template from the **Template** drop-down (or write a
+   custom script).
+5. Click **▶ Run R Analysis** – the script is executed via `Rscript`, the
+   console output is streamed to the *R Console Output* pane, and the
+   generated plot is displayed in the *Plot Output* pane.
+6. Use **💾 Save Plot …** to export the plot or **📥 Export CSV …** to save
+   the raw data for external analysis.
+
+### Built-in R script templates
+
+| Template | Description |
+|---|---|
+| **H-Bond Bar Chart** | Bar chart of H-bond counts per complex (ggplot2) |
+| **H-Bonds vs. Contacts Scatter** | Scatter plot with bubble size = binding-site size |
+| **Binding-Site Residue Frequency** | Horizontal bar chart of the most frequent binding-site residues across all complexes |
+| **Interaction Radar Chart** | Spider/radar chart of normalised interaction metrics per complex |
+| **Interaction Fingerprint Heatmap** | Presence/absence heatmap of binding-site residues |
+| **Ligand Property Space** | 2-D property space plot (heavy atoms vs. H-bonds, coloured by contacts) |
+| **Custom Script …** | Write and run your own R script |
+
+### Placeholder tokens in custom scripts
+
+| Token | Replaced with |
+|---|---|
+| `{{DATA_CSV}}` | Path to the extracted molecular-data CSV |
+| `{{OUT_PNG}}` | Path where your script should write its plot (PNG) |
+
+### Extracted CSV columns
+
+| Column | Description |
+|---|---|
+| `name` | Complex label (subplot caption) |
+| `filename` | Source file name |
+| `hbond_count` | Number of H-bonds (protein ↔ ligand) |
+| `contact_count` | Number of close contacts within `distance_cutoff` |
+| `binding_site_size` | Number of binding-site residues within `label_radius` |
+| `binding_site_residues` | Semicolon-separated list of binding-site residues |
+| `ligand_atoms` | Ligand heavy atom count |
+| `distance_cutoff` | Distance cutoff used for contact detection (Å) |
+| `label_radius` | Radius used for binding-site residue selection (Å) |
+| `ligand_selection` | PyMOL selection string for the ligand |
+| `protein_repr` | Protein representation |
+| `ligand_repr` | Ligand representation |
+
+### Required R packages
+
+The built-in templates auto-install missing packages from CRAN when first run.
+Packages used:
+
+- **ggplot2** – all plotting templates
+- **tidyr** – Interaction Radar Chart and Fingerprint Heatmap
 
 ---
 
