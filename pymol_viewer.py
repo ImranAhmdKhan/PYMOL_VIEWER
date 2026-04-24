@@ -17,7 +17,9 @@ Usage
 import os
 import sys
 import gzip
+import math
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -32,8 +34,9 @@ from PyQt5.QtWidgets import (
     QTabWidget, QScrollArea, QFrame, QSplitter, QMessageBox,
     QColorDialog, QProgressBar, QStatusBar, QLineEdit, QSlider,
     QAbstractItemView, QSizePolicy, QFormLayout,
+    QDialog, QDialogButtonBox, QAction, QMenuBar,
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings
 from PyQt5.QtGui import QPixmap, QImage, QColor, QFont, QIcon
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,44 @@ RAY_MODES = {
 }
 EXPORT_FORMATS = ["PNG", "TIFF", "PDF"]
 
+# ---------------------------------------------------------------------------
+# App-level settings keys
+# ---------------------------------------------------------------------------
+SETTINGS_ORG  = "PyMOLViewer"
+SETTINGS_APP  = "PyMOLViewer"
+KEY_PYMOL_PATH = "pymol_scripts_path"
+KEY_VMD_PATH   = "vmd_exe_path"
+
+_DEFAULT_PYMOL_PATH = r"C:\Users\<username>\AppData\Local\Schrodinger\PyMOL2\Scripts"
+_DEFAULT_VMD_PATH   = r"C:\Program Files\University of Illinois\VMD\vmd.exe"
+
+
+def _load_app_settings() -> QSettings:
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+def _setup_pymol_path():
+    """Inject the configured PyMOL scripts directory into sys.path so that
+    ``import pymol2`` resolves to the Schrödinger (or any custom) build."""
+    s = _load_app_settings()
+    path = s.value(KEY_PYMOL_PATH, _DEFAULT_PYMOL_PATH)
+    if path and os.path.isdir(path) and path not in sys.path:
+        sys.path.insert(0, path)
+        # Also add the parent directory (sometimes needed for Schrödinger)
+        parent = str(Path(path).parent)
+        if parent not in sys.path:
+            sys.path.insert(1, parent)
+
+
+def _resolve_vmd_exe() -> str:
+    """Return the VMD executable path from settings.
+
+    On Windows the user may have supplied a .lnk shortcut; we fall back to
+    resolving via the shell (``start`` command) in that case.
+    """
+    s = _load_app_settings()
+    return s.value(KEY_VMD_PATH, _DEFAULT_VMD_PATH)
+
 
 class ComplexEntry:
     """All settings for one protein–ligand complex."""
@@ -112,6 +153,14 @@ class ComplexEntry:
         # Ray settings
         self.bg_color: str = "white"
         self.ray_shadows: bool = True
+
+        # Docking analysis / annotation
+        self.show_residue_labels: bool = True   # label residues within radius
+        self.label_radius: float = 5.0          # Å from ligand to show labels
+        self.label_color: str = "black"         # label text colour in PyMOL
+        self.show_distances: bool = False        # draw extra distance lines
+        self.distance_cutoff: float = 4.0       # Å cutoff for contact distances
+        self.zoom_extra: float = 0.0            # extra zoom-out (0 = default)
 
 
 # ===========================================================================
@@ -148,6 +197,7 @@ class RenderWorker(QThread):
 
     # ------------------------------------------------------------------
     def _render(self):
+        _setup_pymol_path()   # ensure configured PyMOL is on sys.path
         try:
             import pymol2
         except ImportError:
@@ -256,10 +306,41 @@ class RenderWorker(QThread):
                     except Exception:
                         pass
 
+                # ── contact distances (docking analysis) ─────────────────
+                if cx.show_distances:
+                    try:
+                        dist_name = f"contacts_{idx}"
+                        cmd.dist(dist_name, ligand_sel, protein_sel,
+                                 mode=0, cutoff=cx.distance_cutoff, label=1)
+                        cmd.color("cyan", dist_name)
+                        cmd.set("dash_width",  1.5, dist_name)
+                        cmd.set("label_size",  10,  dist_name)
+                        cmd.set("label_color", "cyan", dist_name)
+                    except Exception:
+                        pass
+
+                # ── residue labels around ligand ─────────────────────────
+                if cx.show_residue_labels:
+                    try:
+                        nearby_sel = (
+                            f"({cx.name}) and polymer and "
+                            f"(byres (all within {cx.label_radius} of ({ligand_sel})))"
+                        )
+                        cmd.set("label_size",  12)
+                        cmd.set("label_color", cx.label_color)
+                        cmd.set("label_font_id", 7)   # bold
+                        cmd.label(
+                            f"{nearby_sel} and name CA",
+                            r'"%s%s" % (resn, resi)',
+                        )
+                    except Exception:
+                        pass
+
                 # ── camera – zoom on ligand ──────────────────────────────
                 try:
                     cmd.orient(ligand_sel)
-                    cmd.zoom(ligand_sel, 6)
+                    zoom_buf = 6 + cx.zoom_extra
+                    cmd.zoom(ligand_sel, zoom_buf)
                 except Exception:
                     cmd.zoom(cx.name)
 
@@ -514,6 +595,55 @@ class ComplexSettingsPanel(QWidget):
         self.w_shadows.toggled.connect(self._sync)
         layout.addRow("", self.w_shadows)
 
+        # ── Docking analysis ────────────────────────────────────────────
+        sep = QLabel("─── Docking Analysis ───")
+        sep.setAlignment(Qt.AlignCenter)
+        layout.addRow(sep)
+
+        # Residue labels
+        self.w_res_labels = QCheckBox("Label binding-site residues")
+        self.w_res_labels.setChecked(self.entry.show_residue_labels)
+        self.w_res_labels.toggled.connect(self._sync)
+        layout.addRow("", self.w_res_labels)
+
+        self.w_label_radius = QDoubleSpinBox()
+        self.w_label_radius.setRange(1.0, 20.0)
+        self.w_label_radius.setSingleStep(0.5)
+        self.w_label_radius.setSuffix(" Å")
+        self.w_label_radius.setValue(self.entry.label_radius)
+        self.w_label_radius.valueChanged.connect(self._sync)
+        layout.addRow("Label radius:", self.w_label_radius)
+
+        self.w_label_color = QComboBox()
+        self.w_label_color.addItems(["black", "white", "yellow", "cyan",
+                                     "magenta", "green", "red", "blue"])
+        self.w_label_color.setCurrentText(self.entry.label_color)
+        self.w_label_color.currentTextChanged.connect(self._sync)
+        layout.addRow("Label color:", self.w_label_color)
+
+        # Contact distances
+        self.w_distances = QCheckBox("Show contact distances")
+        self.w_distances.setChecked(self.entry.show_distances)
+        self.w_distances.toggled.connect(self._sync)
+        layout.addRow("", self.w_distances)
+
+        self.w_dist_cutoff = QDoubleSpinBox()
+        self.w_dist_cutoff.setRange(1.0, 10.0)
+        self.w_dist_cutoff.setSingleStep(0.5)
+        self.w_dist_cutoff.setSuffix(" Å")
+        self.w_dist_cutoff.setValue(self.entry.distance_cutoff)
+        self.w_dist_cutoff.valueChanged.connect(self._sync)
+        layout.addRow("Distance cutoff:", self.w_dist_cutoff)
+
+        # Zoom extra
+        self.w_zoom_extra = QDoubleSpinBox()
+        self.w_zoom_extra.setRange(-5.0, 30.0)
+        self.w_zoom_extra.setSingleStep(1.0)
+        self.w_zoom_extra.setSuffix(" Å")
+        self.w_zoom_extra.setValue(self.entry.zoom_extra)
+        self.w_zoom_extra.valueChanged.connect(self._sync)
+        layout.addRow("Extra zoom-out:", self.w_zoom_extra)
+
     def _sync(self):
         self.entry.label                 = self.w_label.text()
         self.entry.ligand_selection      = self.w_ligand_sel.text() or "organic"
@@ -526,7 +656,97 @@ class ComplexSettingsPanel(QWidget):
         self.entry.show_hbonds           = self.w_hbonds.isChecked()
         self.entry.bg_color              = self.w_bg.currentText()
         self.entry.ray_shadows           = self.w_shadows.isChecked()
+        self.entry.show_residue_labels   = self.w_res_labels.isChecked()
+        self.entry.label_radius          = self.w_label_radius.value()
+        self.entry.label_color           = self.w_label_color.currentText()
+        self.entry.show_distances        = self.w_distances.isChecked()
+        self.entry.distance_cutoff       = self.w_dist_cutoff.value()
+        self.entry.zoom_extra            = self.w_zoom_extra.value()
         self.changed.emit()
+
+
+# ===========================================================================
+# Settings dialog
+# ===========================================================================
+
+class SettingsDialog(QDialog):
+    """Configure paths to PyMOL (Schrödinger build) and VMD."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Application Settings")
+        self.setMinimumWidth(560)
+
+        s = _load_app_settings()
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+
+        # PyMOL scripts path
+        pymol_row = QHBoxLayout()
+        self.w_pymol = QLineEdit(s.value(KEY_PYMOL_PATH, _DEFAULT_PYMOL_PATH))
+        self.w_pymol.setPlaceholderText(r"e.g. C:\…\PyMOL2\Scripts")
+        btn_pymol = QPushButton("Browse …")
+        btn_pymol.clicked.connect(self._browse_pymol)
+        pymol_row.addWidget(self.w_pymol)
+        pymol_row.addWidget(btn_pymol)
+        form.addRow("PyMOL Scripts path:", pymol_row)
+
+        pymol_hint = QLabel(
+            "Directory that contains pymol2.py / pymol package.\n"
+            r"Example: C:\Users\<username>\AppData\Local\Schrodinger\PyMOL2\Scripts"
+        )
+        pymol_hint.setStyleSheet("color: #aaa; font-size: 10px;")
+        form.addRow("", pymol_hint)
+
+        # VMD executable path
+        vmd_row = QHBoxLayout()
+        self.w_vmd = QLineEdit(s.value(KEY_VMD_PATH, _DEFAULT_VMD_PATH))
+        self.w_vmd.setPlaceholderText(r'e.g. C:\Program Files\University of Illinois\VMD\vmd.exe')
+        btn_vmd = QPushButton("Browse …")
+        btn_vmd.clicked.connect(self._browse_vmd)
+        vmd_row.addWidget(self.w_vmd)
+        vmd_row.addWidget(btn_vmd)
+        form.addRow("VMD executable:", vmd_row)
+
+        vmd_hint = QLabel(
+            "Full path to vmd.exe or a .lnk shortcut.\n"
+            r"Example: C:\Users\<username>\Desktop\VMD 2.0.lnk"
+        )
+        vmd_hint.setStyleSheet("color: #aaa; font-size: 10px;")
+        form.addRow("", vmd_hint)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_pymol(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select PyMOL Scripts directory",
+            self.w_pymol.text() or "C:\\"
+        )
+        if path:
+            self.w_pymol.setText(path)
+
+    def _browse_vmd(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select VMD executable",
+            self.w_vmd.text() or "C:\\",
+            "Executables / Shortcuts (*.exe *.lnk);;All (*)"
+        )
+        if path:
+            self.w_vmd.setText(path)
+
+    def _save_and_accept(self):
+        s = _load_app_settings()
+        s.setValue(KEY_PYMOL_PATH, self.w_pymol.text().strip())
+        s.setValue(KEY_VMD_PATH,   self.w_vmd.text().strip())
+        self.accept()
 
 
 # ===========================================================================
@@ -537,14 +757,53 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyMOL – Publication-Quality Protein–Ligand Viewer")
+        self.setWindowTitle("PyMOL / VMD – Publication-Quality Docking Viewer")
         self.resize(1280, 820)
+
+        # Inject configured PyMOL path before any pymol2 import attempt
+        _setup_pymol_path()
 
         self.complexes: List[ComplexEntry] = []
         self._worker: Optional[RenderWorker] = None
 
+        self._build_menu()
         self._build_ui()
         self._update_button_states()
+
+    # -----------------------------------------------------------------------
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("File")
+        act_add = QAction("Add Files …", self)
+        act_add.setShortcut("Ctrl+O")
+        act_add.triggered.connect(self._add_files)
+        file_menu.addAction(act_add)
+
+        act_clear = QAction("Clear All", self)
+        act_clear.triggered.connect(self._clear_all)
+        file_menu.addAction(act_clear)
+
+        file_menu.addSeparator()
+        act_quit = QAction("Quit", self)
+        act_quit.setShortcut("Ctrl+Q")
+        act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_quit)
+
+        tools_menu = menubar.addMenu("Tools")
+        act_open_pymol = QAction("Open Selected in PyMOL (Interactive) …", self)
+        act_open_pymol.triggered.connect(self._open_in_pymol_interactive)
+        tools_menu.addAction(act_open_pymol)
+
+        act_open_vmd = QAction("Open Selected in VMD …", self)
+        act_open_vmd.triggered.connect(self._open_in_vmd)
+        tools_menu.addAction(act_open_vmd)
+
+        tools_menu.addSeparator()
+        act_settings = QAction("Settings …", self)
+        act_settings.setShortcut("Ctrl+,")
+        act_settings.triggered.connect(self._open_settings)
+        tools_menu.addAction(act_settings)
 
     # -----------------------------------------------------------------------
     def _build_ui(self):
@@ -727,6 +986,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         lay.addWidget(self.progress_bar, stretch=1)
 
+        self.btn_open_pymol = QPushButton("🔬 Open in PyMOL")
+        self.btn_open_pymol.setToolTip("Launch selected file(s) in PyMOL interactive GUI")
+        self.btn_open_pymol.clicked.connect(self._open_in_pymol_interactive)
+
+        self.btn_open_vmd = QPushButton("🧬 Open in VMD")
+        self.btn_open_vmd.setToolTip("Launch selected file(s) in VMD")
+        self.btn_open_vmd.clicked.connect(self._open_in_vmd)
+
         self.btn_preview = QPushButton("🔍 Quick Preview")
         self.btn_preview.setToolTip("Low-resolution preview (fast, no ray-tracing)")
         self.btn_preview.clicked.connect(self._run_preview)
@@ -743,6 +1010,8 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setVisible(False)
         self.btn_cancel.clicked.connect(self._cancel_render)
 
+        lay.addWidget(self.btn_open_pymol)
+        lay.addWidget(self.btn_open_vmd)
         lay.addWidget(self.btn_preview)
         lay.addWidget(self.btn_render)
         lay.addWidget(self.btn_cancel)
@@ -803,6 +1072,8 @@ class MainWindow(QMainWindow):
         self.btn_render.setEnabled(has)
         self.btn_remove.setEnabled(has)
         self.btn_clear.setEnabled(has)
+        self.btn_open_pymol.setEnabled(has)
+        self.btn_open_vmd.setEnabled(has)
 
     # -----------------------------------------------------------------------
     # Layout helpers
@@ -903,6 +1174,151 @@ class MainWindow(QMainWindow):
         self._reset_ui()
         self.statusBar().showMessage("Cancelled.")
 
+    # -----------------------------------------------------------------------
+    # External viewer launchers
+    # -----------------------------------------------------------------------
+
+    def _files_to_open(self) -> List[str]:
+        """Return paths of all loaded complexes (all files when none selected)."""
+        row = self.file_list.currentRow()
+        if row >= 0 and row < len(self.complexes):
+            return [self.complexes[row].filepath]
+        return [cx.filepath for cx in self.complexes]
+
+    def _open_in_pymol_interactive(self):
+        """Launch PyMOL GUI with the selected (or all) structure files."""
+        files = self._files_to_open()
+        if not files:
+            return
+
+        # Try to find the pymol executable next to the configured scripts path
+        s = _load_app_settings()
+        scripts_path = s.value(KEY_PYMOL_PATH, _DEFAULT_PYMOL_PATH)
+        pymol_exe = None
+
+        candidates: List[str] = []
+        if scripts_path:
+            # Schrödinger layout: Scripts/pymol.exe  or  Scripts/pymol
+            candidates += [
+                os.path.join(scripts_path, "pymol.exe"),
+                os.path.join(scripts_path, "pymol"),
+                os.path.join(str(Path(scripts_path).parent), "pymol.exe"),
+                os.path.join(str(Path(scripts_path).parent), "pymol"),
+            ]
+        candidates += ["pymol"]  # system PATH fallback
+
+        for c in candidates:
+            if os.path.isfile(c) or shutil.which(c):
+                pymol_exe = c
+                break
+
+        if not pymol_exe:
+            QMessageBox.warning(
+                self, "PyMOL not found",
+                "Could not locate a PyMOL executable.\n"
+                "Please set the correct path in Tools → Settings."
+            )
+            return
+
+        try:
+            self._launch_external([pymol_exe] + files)
+            self.statusBar().showMessage(f"Launched PyMOL with {len(files)} file(s).")
+        except Exception as exc:
+            QMessageBox.critical(self, "Launch Error", str(exc))
+
+    def _open_in_vmd(self):
+        """Launch VMD with the selected (or all) structure files."""
+        files = self._files_to_open()
+        if not files:
+            return
+
+        vmd_path = _resolve_vmd_exe()
+
+        # Resolve .lnk shortcuts on Windows via the shell
+        if vmd_path.lower().endswith(".lnk"):
+            self._launch_vmd_lnk(vmd_path, files)
+            return
+
+        if not (os.path.isfile(vmd_path) or shutil.which(vmd_path)):
+            QMessageBox.warning(
+                self, "VMD not found",
+                f"VMD executable not found at:\n{vmd_path}\n\n"
+                "Please set the correct path in Tools → Settings."
+            )
+            return
+
+        # Decompress any .maegz files to temporary .mae files for VMD
+        vmd_files, tmp_paths = self._prepare_vmd_files(files)
+        try:
+            self._launch_external([vmd_path] + vmd_files)
+            self.statusBar().showMessage(f"Launched VMD with {len(vmd_files)} file(s).")
+        except Exception as exc:
+            QMessageBox.critical(self, "Launch Error", str(exc))
+        finally:
+            # Schedule cleanup of temp files after a short delay
+            self._schedule_tmp_cleanup(tmp_paths)
+
+    @staticmethod
+    def _prepare_vmd_files(files: List[str]) -> Tuple[List[str], List[str]]:
+        """Decompress .maegz files to temporary .mae files for VMD.
+
+        Returns a tuple of (file_paths_for_vmd, temp_paths_to_cleanup).
+        """
+        out: List[str] = []
+        tmp_paths: List[str] = []
+        for f in files:
+            if f.lower().endswith(".maegz"):
+                tmp = tempfile.NamedTemporaryFile(suffix=".mae", delete=False)
+                with gzip.open(f, "rb") as gz:
+                    shutil.copyfileobj(gz, tmp)
+                tmp.close()
+                out.append(tmp.name)
+                tmp_paths.append(tmp.name)
+            else:
+                out.append(f)
+        return out, tmp_paths
+
+    @staticmethod
+    def _schedule_tmp_cleanup(paths: List[str]):
+        """Remove temporary files after a short delay (30 s) to allow VMD to load them."""
+        if not paths:
+            return
+        from PyQt5.QtCore import QTimer
+
+        def _cleanup():
+            for p in paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+        QTimer.singleShot(30_000, _cleanup)
+
+    @staticmethod
+    def _launch_external(cmd: List[str]):
+        """Start an external process without blocking the GUI."""
+        subprocess.Popen(cmd, close_fds=True)
+
+    @staticmethod
+    def _launch_vmd_lnk(lnk_path: str, files: List[str]):
+        """Open a Windows .lnk shortcut via the shell with file arguments."""
+        # 'start' can resolve .lnk but doesn't pass extra args reliably;
+        # open via explorer with the shortcut then inform the user.
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", lnk_path], shell=False)
+        except Exception:
+            subprocess.Popen(["explorer", lnk_path])
+
+    # -----------------------------------------------------------------------
+    # Settings
+    # -----------------------------------------------------------------------
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            _setup_pymol_path()
+            self.statusBar().showMessage("Settings saved.")
+
     def _on_progress(self, val: int):
         self.progress_bar.setValue(val)
 
@@ -955,6 +1371,9 @@ class MainWindow(QMainWindow):
 # ===========================================================================
 
 def main():
+    # Inject PyMOL path early so imports work before the window is shown
+    _setup_pymol_path()
+
     app = QApplication(sys.argv)
     app.setApplicationName("PyMOL Viewer")
     app.setStyle("Fusion")
