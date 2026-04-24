@@ -14,7 +14,9 @@ Usage
     python pymol_viewer.py
 """
 
+import csv
 import os
+import platform
 import sys
 import gzip
 import math
@@ -33,7 +35,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QListWidget, QListWidgetItem, QGroupBox, QCheckBox,
     QTabWidget, QScrollArea, QFrame, QSplitter, QMessageBox,
     QColorDialog, QProgressBar, QStatusBar, QLineEdit, QSlider,
-    QAbstractItemView, QSizePolicy, QFormLayout,
+    QAbstractItemView, QSizePolicy, QFormLayout, QTextEdit,
     QDialog, QDialogButtonBox, QAction, QMenuBar,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings
@@ -96,6 +98,247 @@ KEY_VMD_PATH   = "vmd_exe_path"
 
 _DEFAULT_PYMOL_PATH = r"C:\Users\<username>\AppData\Local\Schrodinger\PyMOL2\Scripts"
 _DEFAULT_VMD_PATH   = r"C:\Program Files\University of Illinois\VMD\vmd.exe"
+
+# ---------------------------------------------------------------------------
+# R integration – settings key and default Rscript executable
+# ---------------------------------------------------------------------------
+KEY_R_PATH = "r_exe_path"
+_DEFAULT_R_PATH = "Rscript.exe" if platform.system() == "Windows" else "Rscript"
+
+# ---------------------------------------------------------------------------
+# Built-in R script templates
+# Placeholders replaced at runtime:
+#   {{DATA_CSV}}  – path to the extracted molecular-data CSV
+#   {{OUT_PNG}}   – path where the generated plot PNG should be written
+# ---------------------------------------------------------------------------
+
+_R_HBOND_BAR = r"""
+suppressMessages({
+  for (pkg in c("ggplot2")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}")
+
+p <- ggplot(data, aes(x=reorder(name, -hbond_count), y=hbond_count,
+                      fill=hbond_count)) +
+  geom_col(colour="black", width=0.7) +
+  scale_fill_gradient(low="#74c0fc", high="#1971c2") +
+  theme_bw(base_size=14) +
+  labs(title="Protein\u2013Ligand H-Bond Count per Complex",
+       x="Complex", y="H-Bond Count") +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        legend.position="none")
+
+ggsave("{{OUT_PNG}}", p, width=8, height=5, dpi=150)
+cat("H-Bond bar chart saved.\n")
+"""
+
+_R_CONTACT_SCATTER = r"""
+suppressMessages({
+  for (pkg in c("ggplot2")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}")
+
+p <- ggplot(data, aes(x=contact_count, y=hbond_count, label=name)) +
+  geom_point(aes(size=binding_site_size, colour=binding_site_size),
+             alpha=0.85) +
+  geom_text(vjust=-0.9, size=3.5, fontface="bold") +
+  scale_colour_viridis_c(option="plasma") +
+  scale_size_continuous(range=c(4, 12)) +
+  theme_bw(base_size=14) +
+  labs(title="H-Bonds vs. Close Contacts",
+       subtitle="Bubble size = binding-site residue count",
+       x=paste0("Close Contacts (\u2264 ", data$distance_cutoff[1], " \u00c5)"),
+       y="H-Bond Count",
+       colour="Binding\nSite Size", size="Binding\nSite Size")
+
+ggsave("{{OUT_PNG}}", p, width=8, height=6, dpi=150)
+cat("Scatter plot saved.\n")
+"""
+
+_R_RESIDUE_FREQ = r"""
+suppressMessages({
+  for (pkg in c("ggplot2")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}", stringsAsFactors=FALSE)
+
+residues <- unlist(strsplit(as.character(data$binding_site_residues), ";"))
+residues <- trimws(residues[!is.na(residues) & nchar(trimws(residues)) > 0])
+
+if (length(residues) == 0) {
+  cat("No binding-site residue data found.\n")
+  quit(status=0)
+}
+
+freq <- as.data.frame(table(residues), stringsAsFactors=FALSE)
+colnames(freq) <- c("residue", "frequency")
+freq <- freq[order(-freq$frequency), ][seq_len(min(20L, nrow(freq))), ]
+
+p <- ggplot(freq, aes(x=reorder(residue, frequency), y=frequency,
+                      fill=frequency)) +
+  geom_col(colour="black") +
+  coord_flip() +
+  scale_fill_gradient(low="#e9ecef", high="#c92a2a") +
+  theme_bw(base_size=13) +
+  labs(title="Binding-Site Residue Frequency",
+       subtitle="Top residues across all loaded complexes",
+       x="Residue", y="Frequency") +
+  theme(legend.position="none")
+
+ggsave("{{OUT_PNG}}", p, width=8, height=6, dpi=150)
+cat("Residue frequency plot saved.\n")
+"""
+
+_R_RADAR = r"""
+suppressMessages({
+  for (pkg in c("ggplot2", "tidyr")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}", stringsAsFactors=FALSE)
+
+cols <- intersect(c("hbond_count", "contact_count",
+                    "binding_site_size", "ligand_atoms"), colnames(data))
+
+if (length(cols) < 2 || nrow(data) == 0) {
+  cat("Not enough data for radar chart.\n")
+  quit(status=0)
+}
+
+# Normalise each metric to [0, 1]
+norm <- data
+for (col in cols) {
+  mx <- max(data[[col]], na.rm=TRUE)
+  norm[[col]] <- if (mx > 0) data[[col]] / mx else data[[col]]
+}
+
+long <- tidyr::pivot_longer(norm, cols=all_of(cols),
+                             names_to="metric", values_to="value")
+
+p <- ggplot(long, aes(x=metric, y=value, group=name,
+                      colour=name, fill=name)) +
+  geom_polygon(alpha=0.20) +
+  geom_point(size=3) +
+  coord_polar() +
+  scale_y_continuous(limits=c(0, 1), breaks=c(0.25, 0.5, 0.75, 1)) +
+  theme_bw(base_size=13) +
+  labs(title="Normalised Interaction Profile",
+       subtitle="Each axis scaled to the maximum across all complexes",
+       colour="Complex", fill="Complex", x=NULL, y=NULL) +
+  theme(axis.text.y=element_blank(), axis.ticks.y=element_blank())
+
+ggsave("{{OUT_PNG}}", p, width=8, height=7, dpi=150)
+cat("Radar / spider chart saved.\n")
+"""
+
+_R_HEATMAP = r"""
+suppressMessages({
+  for (pkg in c("ggplot2", "tidyr")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}", stringsAsFactors=FALSE)
+
+# Expand binding_site_residues and build presence/absence matrix
+all_res <- unique(trimws(unlist(strsplit(data$binding_site_residues, ";"))))
+all_res <- all_res[nchar(all_res) > 0]
+
+if (length(all_res) == 0 || nrow(data) == 0) {
+  cat("No residue data available for heat-map.\n")
+  quit(status=0)
+}
+
+mat <- data.frame(complex=data$name)
+for (r in all_res) {
+  mat[[r]] <- as.integer(grepl(r, data$binding_site_residues, fixed=TRUE))
+}
+
+long <- tidyr::pivot_longer(mat, cols=-complex,
+                             names_to="residue", values_to="present")
+
+# Keep only residues that appear in at least one complex
+freq_res <- long[long$present == 1, ]
+keep <- names(sort(table(freq_res$residue), decreasing=TRUE))[
+  seq_len(min(30L, length(all_res)))]
+long <- long[long$residue %in% keep, ]
+
+p <- ggplot(long, aes(x=residue, y=complex, fill=factor(present))) +
+  geom_tile(colour="white", linewidth=0.4) +
+  scale_fill_manual(values=c("0"="#f1f3f5", "1"="#2f9e44"),
+                    labels=c("Absent", "Present")) +
+  theme_bw(base_size=12) +
+  labs(title="Binding-Site Interaction Fingerprint Heatmap",
+       x="Residue", y="Complex", fill=NULL) +
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+
+ggsave("{{OUT_PNG}}", p, width=max(8, length(keep)*0.35), height=5, dpi=150,
+       limitsize=FALSE)
+cat("Interaction fingerprint heatmap saved.\n")
+"""
+
+_R_PROPERTY_SPACE = r"""
+suppressMessages({
+  for (pkg in c("ggplot2")) {
+    if (!requireNamespace(pkg, quietly=TRUE))
+      install.packages(pkg, repos="https://cloud.r-project.org")
+    library(pkg, character.only=TRUE)
+  }
+})
+
+data <- read.csv("{{DATA_CSV}}", stringsAsFactors=FALSE)
+
+# Lipinski-like axes: ligand_atoms as proxy for MW, hbond_count for HBD/HBA
+p <- ggplot(data,
+            aes(x=ligand_atoms, y=hbond_count, colour=contact_count,
+                size=binding_site_size, label=name)) +
+  geom_point(alpha=0.8) +
+  geom_text(vjust=-1.0, size=3.2, show.legend=FALSE) +
+  scale_colour_viridis_c(option="magma") +
+  scale_size_continuous(range=c(4, 14)) +
+  theme_bw(base_size=14) +
+  labs(title="Ligand Property Space",
+       x="Ligand Heavy Atoms (MW proxy)",
+       y="H-Bond Count (HBD + HBA proxy)",
+       colour="Close\nContacts", size="Binding\nSite Size")
+
+ggsave("{{OUT_PNG}}", p, width=9, height=6, dpi=150)
+cat("Property space plot saved.\n")
+"""
+
+_R_TEMPLATES = {
+    "H-Bond Bar Chart":               _R_HBOND_BAR,
+    "H-Bonds vs. Contacts Scatter":   _R_CONTACT_SCATTER,
+    "Binding-Site Residue Frequency": _R_RESIDUE_FREQ,
+    "Interaction Radar Chart":        _R_RADAR,
+    "Interaction Fingerprint Heatmap": _R_HEATMAP,
+    "Ligand Property Space":          _R_PROPERTY_SPACE,
+    "Custom Script \u2026":           "# Write your R script here.\n"
+                                      "# Placeholders:\n"
+                                      "#   {{DATA_CSV}}  – path to extracted CSV data\n"
+                                      "#   {{OUT_PNG}}   – write your plot here\n\n"
+                                      "data <- read.csv(\"{{DATA_CSV}}\")\n"
+                                      "print(head(data))\n",
+}
 
 
 def _load_app_settings() -> QSettings:
@@ -505,8 +748,646 @@ class RenderWorker(QThread):
 
 
 # ===========================================================================
-# Per-complex settings panel
+# Data extraction worker (headless PyMOL – collects interaction metrics)
 # ===========================================================================
+
+class DataExtractionWorker(QThread):
+    """Run headless PyMOL to extract H-bond, contact and residue data for
+    every loaded ComplexEntry and write results to a CSV file."""
+
+    progress = pyqtSignal(int)   # 0-100
+    status   = pyqtSignal(str)
+    finished = pyqtSignal(str)   # path to CSV
+    error    = pyqtSignal(str)
+
+    def __init__(self, complexes: List[ComplexEntry], parent=None):
+        super().__init__(parent)
+        self.complexes = complexes
+
+    # ------------------------------------------------------------------
+    def run(self):
+        try:
+            self._extract()
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    def _extract(self):
+        _setup_pymol_path()
+        try:
+            import pymol2
+        except ImportError:
+            self.error.emit(
+                "PyMOL is not installed.\n"
+                "Install it with:  pip install pymol-open-source"
+            )
+            return
+
+        rows: List[dict] = []
+
+        for idx, cx in enumerate(self.complexes):
+            self.status.emit(
+                f"Extracting [{idx + 1}/{len(self.complexes)}]  {cx.filename} …"
+            )
+            self.progress.emit(int(idx / len(self.complexes) * 90))
+
+            with pymol2.PyMOL() as pymol:
+                cmd = pymol.cmd
+
+                # ── load file ────────────────────────────────────────────
+                filepath = cx.filepath
+                _tmp_mae = None
+                if filepath.lower().endswith(".maegz"):
+                    _tmp_mae = tempfile.NamedTemporaryFile(
+                        suffix=".mae", delete=False
+                    )
+                    with gzip.open(filepath, "rb") as gz:
+                        shutil.copyfileobj(gz, _tmp_mae)
+                    _tmp_mae.close()
+                    filepath = _tmp_mae.name
+
+                try:
+                    cmd.load(filepath, cx.name)
+                except Exception as exc:
+                    rows.append(self._empty_row(cx))
+                    continue
+                finally:
+                    if _tmp_mae and os.path.exists(_tmp_mae.name):
+                        os.unlink(_tmp_mae.name)
+
+                cmd.remove("solvent")
+                cmd.remove("inorganic and not metals")
+
+                protein_sel = f"({cx.name}) and polymer"
+                ligand_sel  = f"({cx.name}) and ({cx.ligand_selection})"
+
+                # ── H-bond count ─────────────────────────────────────────
+                hbond_count = 0
+                try:
+                    pairs = cmd.find_pairs(
+                        protein_sel, ligand_sel, mode=1, cutoff=3.5, angle=50
+                    )
+                    hbond_count = len(pairs) if pairs else 0
+                except Exception:
+                    pass
+
+                # ── close-contact count ───────────────────────────────────
+                contact_count = 0
+                try:
+                    contacts = cmd.find_pairs(
+                        ligand_sel, protein_sel, mode=0,
+                        cutoff=cx.distance_cutoff
+                    )
+                    contact_count = len(contacts) if contacts else 0
+                except Exception:
+                    pass
+
+                # ── binding-site residues ─────────────────────────────────
+                binding_residues: List[str] = []
+                try:
+                    nearby_sel = (
+                        f"({cx.name}) and polymer and "
+                        f"(byres (all within {cx.label_radius} of ({ligand_sel})))"
+                    )
+                    stored: List[str] = []
+                    cmd.iterate(
+                        f"{nearby_sel} and name CA",
+                        "stored.append(resn + resi)",
+                        space={"stored": stored},
+                    )
+                    seen: dict = {}
+                    for r in stored:
+                        seen.setdefault(r, None)
+                    binding_residues = list(seen.keys())
+                except Exception:
+                    pass
+
+                # ── ligand atom count ─────────────────────────────────────
+                ligand_atoms = 0
+                try:
+                    ligand_atoms = cmd.count_atoms(ligand_sel)
+                except Exception:
+                    pass
+
+                rows.append({
+                    "name":                   cx.label,
+                    "filename":               cx.filename,
+                    "hbond_count":            hbond_count,
+                    "contact_count":          contact_count,
+                    "binding_site_size":      len(binding_residues),
+                    "binding_site_residues":  ";".join(binding_residues),
+                    "ligand_atoms":           ligand_atoms,
+                    "distance_cutoff":        cx.distance_cutoff,
+                    "label_radius":           cx.label_radius,
+                    "ligand_selection":       cx.ligand_selection,
+                    "protein_repr":           cx.protein_repr,
+                    "ligand_repr":            cx.ligand_repr,
+                })
+
+        # ── write CSV ────────────────────────────────────────────────────
+        csv_path = os.path.join(tempfile.gettempdir(), "_pymol_r_data.csv")
+        if rows:
+            fieldnames = list(rows[0].keys())
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        self.progress.emit(100)
+        self.finished.emit(csv_path)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _empty_row(cx: ComplexEntry) -> dict:
+        return {
+            "name":                  cx.label,
+            "filename":              cx.filename,
+            "hbond_count":           0,
+            "contact_count":         0,
+            "binding_site_size":     0,
+            "binding_site_residues": "",
+            "ligand_atoms":          0,
+            "distance_cutoff":       cx.distance_cutoff,
+            "label_radius":          cx.label_radius,
+            "ligand_selection":      cx.ligand_selection,
+            "protein_repr":          cx.protein_repr,
+            "ligand_repr":           cx.ligand_repr,
+        }
+
+
+# ===========================================================================
+# R script worker
+# ===========================================================================
+
+class RScriptWorker(QThread):
+    """Execute an R script via Rscript in a background thread.
+
+    Placeholder tokens ``{{DATA_CSV}}`` and ``{{OUT_PNG}}`` inside the script
+    are replaced with the actual paths before execution.
+    """
+
+    progress       = pyqtSignal(int)   # 0-100
+    status         = pyqtSignal(str)
+    finished       = pyqtSignal(str)   # path to generated PNG (may be empty)
+    console_output = pyqtSignal(str)
+    error          = pyqtSignal(str)
+
+    def __init__(
+        self,
+        script: str,
+        data_csv: str,
+        r_exe: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.script   = script
+        self.data_csv = data_csv
+        self.r_exe    = r_exe
+
+    # ------------------------------------------------------------------
+    def run(self):
+        try:
+            self._run_r()
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    def _run_r(self):
+        tmp_dir  = tempfile.mkdtemp(prefix="pymol_r_")
+        out_png  = os.path.join(tmp_dir, "plot.png")
+        r_script = os.path.join(tmp_dir, "analysis.R")
+
+        # Substitute placeholders (use forward slashes for R compatibility)
+        script = self.script
+        script = script.replace("{{DATA_CSV}}", self.data_csv.replace("\\", "/"))
+        script = script.replace("{{OUT_PNG}}",  out_png.replace("\\", "/"))
+
+        with open(r_script, "w", encoding="utf-8") as f:
+            f.write(script)
+
+        self.status.emit("Running R script …")
+        self.progress.emit(20)
+
+        try:
+            result = subprocess.run(
+                [self.r_exe, "--vanilla", r_script],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except FileNotFoundError:
+            self.error.emit(
+                f"R executable not found: {self.r_exe}\n\n"
+                "Please install R (https://cran.r-project.org/) and set "
+                "the path to Rscript in Tools \u2192 Settings."
+            )
+            return
+        except subprocess.TimeoutExpired:
+            self.error.emit("R script timed out (180 s).")
+            return
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            output += "\n--- stderr ---\n" + result.stderr
+        if output.strip():
+            self.console_output.emit(output)
+
+        if result.returncode != 0:
+            self.error.emit(
+                f"R exited with code {result.returncode}.\n"
+                f"See console output for details."
+            )
+            return
+
+        self.progress.emit(95)
+        self.finished.emit(out_png if os.path.exists(out_png) else "")
+
+
+# ===========================================================================
+# R Analysis panel (UI widget for the R tab)
+# ===========================================================================
+
+class RAnalysisPanel(QWidget):
+    """Complete R statistical-analysis panel.
+
+    Provides:
+    - One-click data extraction from PyMOL (H-bonds, contacts, residues …)
+    - Built-in R script templates (bar, scatter, residue freq, radar, heatmap …)
+    - Script editor with syntax-highlighted placeholders
+    - Live console output and embedded plot display
+    - Save plot / export CSV / save-load custom scripts
+    """
+
+    def __init__(self, get_complexes, parent=None):
+        """
+        Parameters
+        ----------
+        get_complexes : callable
+            No-argument callable returning ``List[ComplexEntry]``.
+        """
+        super().__init__(parent)
+        self._get_complexes = get_complexes
+        self._data_csv: Optional[str]             = None
+        self._current_plot_path: Optional[str]    = None
+        self._extraction_worker: Optional[DataExtractionWorker] = None
+        self._r_worker: Optional[RScriptWorker]   = None
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        # ── toolbar ──────────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+
+        self.btn_extract = QPushButton("📊  Extract Data from PyMOL")
+        self.btn_extract.setToolTip(
+            "Run headless PyMOL to compute H-bond counts, close contacts "
+            "and binding-site residues for all loaded complexes."
+        )
+        self.btn_extract.clicked.connect(self._extract_data)
+        toolbar.addWidget(self.btn_extract)
+
+        self.data_status_label = QLabel("No data extracted yet.")
+        self.data_status_label.setStyleSheet("color:#aaa; font-style:italic;")
+        toolbar.addWidget(self.data_status_label, stretch=1)
+
+        root.addLayout(toolbar)
+
+        # ── progress / status ─────────────────────────────────────────────
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setVisible(False)
+        root.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color:#aaa; font-size:10px;")
+        root.addWidget(self.status_label)
+
+        # ── main vertical splitter ────────────────────────────────────────
+        main_splitter = QSplitter(Qt.Vertical)
+        root.addWidget(main_splitter, stretch=1)
+
+        # ── top half: script editor ───────────────────────────────────────
+        script_box = QGroupBox("R Script")
+        sb_layout  = QVBoxLayout(script_box)
+
+        tpl_row = QHBoxLayout()
+        tpl_row.addWidget(QLabel("Template:"))
+        self.w_template = QComboBox()
+        self.w_template.addItems(list(_R_TEMPLATES.keys()))
+        self.w_template.currentTextChanged.connect(self._load_template)
+        tpl_row.addWidget(self.w_template, stretch=1)
+        sb_layout.addLayout(tpl_row)
+
+        self.script_editor = QTextEdit()
+        self.script_editor.setFont(QFont("Courier New", 9))
+        self.script_editor.setPlaceholderText(
+            "Select a template above or write your own R script.\n"
+            "Use {{DATA_CSV}} and {{OUT_PNG}} as path placeholders."
+        )
+        first_tpl = list(_R_TEMPLATES.keys())[0]
+        self.script_editor.setPlainText(_R_TEMPLATES[first_tpl].strip())
+        sb_layout.addWidget(self.script_editor, stretch=1)
+
+        # Button row below editor
+        btn_row = QHBoxLayout()
+
+        self.btn_run = QPushButton("▶  Run R Analysis")
+        self.btn_run.setStyleSheet(
+            "QPushButton { background:#2f9e44; color:white; "
+            "font-weight:bold; padding:6px 16px; }"
+            "QPushButton:disabled { background:#555; }"
+        )
+        self.btn_run.clicked.connect(self._run_analysis)
+        btn_row.addWidget(self.btn_run)
+
+        self.btn_cancel_r = QPushButton("⛔  Cancel")
+        self.btn_cancel_r.setVisible(False)
+        self.btn_cancel_r.clicked.connect(self._cancel_r)
+        btn_row.addWidget(self.btn_cancel_r)
+
+        btn_row.addStretch()
+
+        btn_save_script = QPushButton("💾  Save Script …")
+        btn_save_script.clicked.connect(self._save_script)
+        btn_row.addWidget(btn_save_script)
+
+        btn_load_script = QPushButton("📂  Load Script …")
+        btn_load_script.clicked.connect(self._load_script)
+        btn_row.addWidget(btn_load_script)
+
+        self.btn_export_csv = QPushButton("📥  Export CSV …")
+        self.btn_export_csv.setToolTip("Export the extracted molecular data as a CSV file.")
+        self.btn_export_csv.setEnabled(False)
+        self.btn_export_csv.clicked.connect(self._export_csv)
+        btn_row.addWidget(self.btn_export_csv)
+
+        sb_layout.addLayout(btn_row)
+        main_splitter.addWidget(script_box)
+
+        # ── bottom half: results (plot | console) ─────────────────────────
+        results_splitter = QSplitter(Qt.Horizontal)
+
+        # Plot display
+        plot_box    = QGroupBox("Plot Output")
+        plot_layout = QVBoxLayout(plot_box)
+
+        self.plot_label = QLabel(
+            "Run an R analysis to view the generated plot here."
+        )
+        self.plot_label.setAlignment(Qt.AlignCenter)
+        self.plot_label.setStyleSheet(
+            "background:#1a1a2e; color:#aaaaaa; border:1px solid #333;"
+        )
+        self.plot_label.setMinimumSize(300, 230)
+        self.plot_label.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding
+        )
+
+        plot_scroll = QScrollArea()
+        plot_scroll.setWidgetResizable(True)
+        plot_scroll.setWidget(self.plot_label)
+        plot_layout.addWidget(plot_scroll, stretch=1)
+
+        plot_btn_row = QHBoxLayout()
+        btn_save_plot = QPushButton("💾  Save Plot …")
+        btn_save_plot.clicked.connect(self._save_plot)
+        plot_btn_row.addWidget(btn_save_plot)
+
+        btn_open_plot = QPushButton("🖼  Open in Viewer")
+        btn_open_plot.setToolTip("Open the current plot in the system image viewer.")
+        btn_open_plot.clicked.connect(self._open_plot_external)
+        plot_btn_row.addWidget(btn_open_plot)
+        plot_layout.addLayout(plot_btn_row)
+
+        results_splitter.addWidget(plot_box)
+
+        # Console output
+        console_box    = QGroupBox("R Console Output")
+        console_layout = QVBoxLayout(console_box)
+
+        self.console_output = QTextEdit()
+        self.console_output.setReadOnly(True)
+        self.console_output.setFont(QFont("Courier New", 8))
+        self.console_output.setStyleSheet(
+            "background:#1a1a2e; color:#a9e34b;"
+        )
+        console_layout.addWidget(self.console_output, stretch=1)
+
+        btn_clear = QPushButton("🗑  Clear Console")
+        btn_clear.clicked.connect(self.console_output.clear)
+        console_layout.addWidget(btn_clear)
+
+        results_splitter.addWidget(console_box)
+        results_splitter.setSizes([550, 350])
+
+        main_splitter.addWidget(results_splitter)
+        main_splitter.setSizes([370, 370])
+
+    # ------------------------------------------------------------------
+    # Template loading
+    # ------------------------------------------------------------------
+
+    def _load_template(self, name: str):
+        if name == "Custom Script \u2026":
+            # Don't overwrite a custom script the user may already be editing
+            return
+        script = _R_TEMPLATES.get(name, "")
+        self.script_editor.setPlainText(script.strip())
+
+    # ------------------------------------------------------------------
+    # Data extraction
+    # ------------------------------------------------------------------
+
+    def _extract_data(self):
+        complexes = self._get_complexes()
+        if not complexes:
+            QMessageBox.warning(
+                self, "No files loaded",
+                "Load one or more structure files before extracting data."
+            )
+            return
+        if self._extraction_worker and self._extraction_worker.isRunning():
+            return
+
+        self._extraction_worker = DataExtractionWorker(complexes, parent=self)
+        self._extraction_worker.progress.connect(self.progress_bar.setValue)
+        self._extraction_worker.status.connect(self.status_label.setText)
+        self._extraction_worker.finished.connect(self._on_data_extracted)
+        self._extraction_worker.error.connect(self._on_worker_error)
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.btn_extract.setEnabled(False)
+        self.console_output.append("[Data extraction started…]\n")
+        self._extraction_worker.start()
+
+    def _on_data_extracted(self, csv_path: str):
+        self._data_csv = csv_path
+        self.progress_bar.setVisible(False)
+        self.btn_extract.setEnabled(True)
+        self.btn_export_csv.setEnabled(True)
+        n = len(self._get_complexes())
+        self.data_status_label.setText(
+            f"✅  {n} complex(es) extracted  ·  {os.path.basename(csv_path)}"
+        )
+        self.status_label.setText("Extraction complete – ready to run R analysis.")
+        self.console_output.append(f"[Extracted] {csv_path}\n")
+
+    # ------------------------------------------------------------------
+    # R script execution
+    # ------------------------------------------------------------------
+
+    def _run_analysis(self):
+        if not self._data_csv or not os.path.exists(self._data_csv):
+            QMessageBox.warning(
+                self, "No data",
+                "Click 'Extract Data from PyMOL' first to gather molecular data."
+            )
+            return
+
+        script = self.script_editor.toPlainText().strip()
+        if not script:
+            QMessageBox.warning(self, "Empty script", "The R script editor is empty.")
+            return
+
+        if self._r_worker and self._r_worker.isRunning():
+            return
+
+        s = _load_app_settings()
+        r_exe = s.value(KEY_R_PATH, _DEFAULT_R_PATH)
+
+        self._r_worker = RScriptWorker(
+            script, self._data_csv, r_exe, parent=self
+        )
+        self._r_worker.progress.connect(self.progress_bar.setValue)
+        self._r_worker.status.connect(self.status_label.setText)
+        self._r_worker.finished.connect(self._on_r_finished)
+        self._r_worker.console_output.connect(self.console_output.append)
+        self._r_worker.error.connect(self._on_worker_error)
+
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.btn_run.setEnabled(False)
+        self.btn_cancel_r.setVisible(True)
+        self._r_worker.start()
+
+    def _cancel_r(self):
+        if self._r_worker and self._r_worker.isRunning():
+            self._r_worker.terminate()
+            self._r_worker.wait()
+        self._reset_r_ui()
+        self.status_label.setText("R analysis cancelled.")
+
+    def _on_r_finished(self, plot_path: str):
+        self._reset_r_ui()
+        self.status_label.setText("R analysis complete.")
+        if plot_path and os.path.exists(plot_path):
+            self._current_plot_path = plot_path
+            pix = QPixmap(plot_path)
+            if not pix.isNull():
+                scaled = pix.scaled(
+                    self.plot_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                self.plot_label.setPixmap(scaled)
+            self.console_output.append(f"[Plot] {plot_path}\n")
+        else:
+            self.console_output.append("[No plot file was generated]\n")
+
+    def _reset_r_ui(self):
+        self.progress_bar.setVisible(False)
+        self.btn_run.setEnabled(True)
+        self.btn_cancel_r.setVisible(False)
+
+    def _on_worker_error(self, text: str):
+        self.progress_bar.setVisible(False)
+        self.btn_extract.setEnabled(True)
+        self.btn_run.setEnabled(True)
+        self.btn_cancel_r.setVisible(False)
+        self.status_label.setText("Error – see console output.")
+        self.console_output.append(f"[ERROR]\n{text}\n")
+
+    # ------------------------------------------------------------------
+    # Plot helpers
+    # ------------------------------------------------------------------
+
+    def _save_plot(self):
+        if not self._current_plot_path or not os.path.exists(self._current_plot_path):
+            QMessageBox.information(
+                self, "No plot", "Run an R analysis first to generate a plot."
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", "r_analysis_plot.png",
+            "PNG Image (*.png);;TIFF Image (*.tiff);;All (*)"
+        )
+        if path:
+            shutil.copy2(self._current_plot_path, path)
+            self.status_label.setText(f"Plot saved \u2192 {path}")
+
+    def _open_plot_external(self):
+        if not self._current_plot_path or not os.path.exists(self._current_plot_path):
+            QMessageBox.information(
+                self, "No plot", "Run an R analysis first to generate a plot."
+            )
+            return
+        try:
+            if platform.system() == "Windows":
+                os.startfile(self._current_plot_path)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", self._current_plot_path])
+            else:
+                subprocess.Popen(["xdg-open", self._current_plot_path])
+        except Exception as exc:
+            QMessageBox.critical(self, "Open Error", str(exc))
+
+    # ------------------------------------------------------------------
+    # CSV / script I/O
+    # ------------------------------------------------------------------
+
+    def _export_csv(self):
+        if not self._data_csv or not os.path.exists(self._data_csv):
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Molecular Data", "molecular_data.csv",
+            "CSV Files (*.csv);;All (*)"
+        )
+        if path:
+            shutil.copy2(self._data_csv, path)
+            self.status_label.setText(f"CSV exported \u2192 {path}")
+
+    def _save_script(self):
+        script = self.script_editor.toPlainText()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save R Script", "analysis.R",
+            "R Script (*.R);;All (*)"
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(script)
+            self.status_label.setText(f"Script saved \u2192 {path}")
+
+    def _load_script(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load R Script", "",
+            "R Script (*.R *.r);;All (*)"
+        )
+        if path:
+            with open(path, encoding="utf-8") as f:
+                self.script_editor.setPlainText(f.read())
+            self.w_template.setCurrentText("Custom Script \u2026")
+
+
+
 
 class ComplexSettingsPanel(QWidget):
     """Edit settings for one ComplexEntry."""
@@ -718,6 +1599,24 @@ class SettingsDialog(QDialog):
         vmd_hint.setStyleSheet("color: #aaa; font-size: 10px;")
         form.addRow("", vmd_hint)
 
+        # R executable path
+        r_row = QHBoxLayout()
+        self.w_r = QLineEdit(s.value(KEY_R_PATH, _DEFAULT_R_PATH))
+        self.w_r.setPlaceholderText("e.g. Rscript  or  /usr/bin/Rscript")
+        btn_r = QPushButton("Browse …")
+        btn_r.clicked.connect(self._browse_r)
+        r_row.addWidget(self.w_r)
+        r_row.addWidget(btn_r)
+        form.addRow("Rscript executable:", r_row)
+
+        r_hint = QLabel(
+            "Path to the Rscript binary (part of any R installation).\n"
+            "On Unix/macOS 'Rscript' is usually on PATH; on Windows specify the\n"
+            r"full path, e.g. C:\Program Files\R\R-4.3.0\bin\Rscript.exe"
+        )
+        r_hint.setStyleSheet("color: #aaa; font-size: 10px;")
+        form.addRow("", r_hint)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -733,6 +1632,15 @@ class SettingsDialog(QDialog):
         if path:
             self.w_pymol.setText(path)
 
+    def _browse_r(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Rscript executable",
+            self.w_r.text() or ("C:\\" if platform.system() == "Windows" else "/usr"),
+            "Executables (*.exe Rscript);;All (*)"
+        )
+        if path:
+            self.w_r.setText(path)
+
     def _browse_vmd(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select VMD executable",
@@ -746,6 +1654,7 @@ class SettingsDialog(QDialog):
         s = _load_app_settings()
         s.setValue(KEY_PYMOL_PATH, self.w_pymol.text().strip())
         s.setValue(KEY_VMD_PATH,   self.w_vmd.text().strip())
+        s.setValue(KEY_R_PATH,     self.w_r.text().strip())
         self.accept()
 
 
@@ -757,8 +1666,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyMOL / VMD – Publication-Quality Docking Viewer")
-        self.resize(1280, 820)
+        self.setWindowTitle(
+            "PyMOL / VMD – Publication-Quality Docking Viewer  |  R Analytics"
+        )
+        self.resize(1440, 860)
 
         # Inject configured PyMOL path before any pymol2 import attempt
         _setup_pymol_path()
@@ -815,7 +1726,7 @@ class MainWindow(QMainWindow):
 
         # ── left panel ──────────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(420)
+        left.setFixedWidth(480)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -953,6 +1864,10 @@ class MainWindow(QMainWindow):
         lf.addRow("Format:", self.w_fmt)
 
         tabs.addTab(layout_widget, "Layout & Export")
+
+        # ── Tab 3: R Analysis ───────────────────────────────────────────
+        self.r_panel = RAnalysisPanel(lambda: self.complexes, parent=self)
+        tabs.addTab(self.r_panel, "📊 R Analysis")
 
         return tabs
 
