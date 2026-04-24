@@ -1,0 +1,19 @@
+# Core GUI framework
+PyQt5>=5.15
+
+# Image compositing / subplot assembly
+Pillow>=10.0
+
+# Subplot PDF fallback
+matplotlib>=3.7
+
+# PyMOL – use ONE of the following:
+#
+#   Option A (open-source, pip-installable):
+#       pip install pymol-open-source
+#
+#   Option B (Schrödinger commercial bundle – supports MAE/MAEGZ natively):
+#       Follow the Schrödinger installation instructions and add the
+#       bundled pymol to your PYTHONPATH.
+#
+# The application will display a clear error message if PyMOL is not found.
